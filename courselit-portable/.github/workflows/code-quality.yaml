@@ -1,0 +1,20 @@
+name: Code Quality
+on: [push]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-node@v1
+      with:
+        node-version: '18.x'
+    - uses: pnpm/action-setup@v2
+      with:
+        version: 8
+    - run: pnpm install
+    - name: Linting and prettifying
+      run: |
+        pnpm lint
+        pnpm prettier
+      working-directory: ./

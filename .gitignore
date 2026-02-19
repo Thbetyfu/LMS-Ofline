@@ -1,0 +1,36 @@
+# System & OS Files
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+
+# Portable Binaries (Heavy/Platform specific)
+node-portable/
+mongodb-portable/
+edge-profile/
+
+# Data & Logs (Do NOT commit user data!)
+mongodb-data/
+*.log
+*.lock
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node modules (Installed via script, varies per OS)
+node_modules/
+**/node_modules/
+
+# Next.js Build Output (Generated)
+.next/
+**/build/
+**/dist/
+**/.turbo/
+
+# Environment Variables (Secrets)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

@@ -1,0 +1,42 @@
+FROM node:20-slim
+
+# Enable pnpm
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable
+
+WORKDIR /app
+
+# Copy workspace configuration files
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
+
+# Copy packages and apps source code
+COPY packages ./packages
+COPY apps ./apps
+COPY *.json ./
+COPY *.js ./
+COPY *.ts ./
+
+# Install dependencies
+RUN pnpm install
+
+# Build workspace packages explicitly to ensure order
+# Tier 1: Core Models & Utils
+RUN pnpm --filter @courselit/page-models run build
+RUN pnpm --filter @courselit/email-editor run build
+RUN pnpm --filter @courselit/common-models run build
+RUN pnpm --filter @courselit/utils run build
+RUN pnpm --filter @courselit/common-logic run build
+RUN pnpm --filter @courselit/icons run build
+RUN pnpm --filter @courselit/page-primitives run build
+
+# Tier 2: Components & Editors
+RUN pnpm --filter @courselit/text-editor run build
+RUN pnpm --filter @courselit/components-library run build
+RUN pnpm --filter @courselit/page-blocks run build
+
+# Expose ports
+EXPOSE 3000 3001 3002
+
+# Standard dev command
+CMD ["pnpm", "run", "dev"]

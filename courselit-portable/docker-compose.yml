@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: courselit
+    volumes:
+      - mongodb_data:/data/db
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+    env_file:
+      - .env.local
+    environment:
+      - DB_CONNECTION_STRING=mongodb://mongo:27017/courselit
+      - MONGODB_URI=mongodb://mongo:27017/courselit
+    depends_on:
+      - mongo
+    # volume mounts commented out to verify image content first
+    # volumes:
+    #   - .:/app
+    #   - /app/node_modules
+    #   - /app/apps/web/node_modules
+    #   - /app/packages/common-logic/node_modules
+    #   - /app/packages/common-models/node_modules
+    #   - /app/packages/components-library/node_modules
+
+volumes:
+  mongodb_data:

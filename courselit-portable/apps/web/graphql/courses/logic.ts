@@ -1,0 +1,1041 @@
+/**
+ * Business logic for managing courses.
+ */
+import CourseModel from "@/models/Course";
+import { InternalCourse } from "@courselit/common-logic";
+import UserModel from "@/models/User";
+import { Media, User } from "@courselit/common-models";
+import { responses } from "@/config/strings";
+import {
+    checkIfAuthenticated,
+    validateOffset,
+    checkOwnershipWithoutModel,
+} from "@/lib/graphql";
+import constants from "@/config/constants";
+import {
+    getPaginatedCoursesForAdmin,
+    setupBlog,
+    setupCourse,
+    validateCourse,
+} from "./helpers";
+import Lesson from "@/models/Lesson";
+import GQLContext from "@/models/GQLContext";
+import Filter from "./models/filter";
+import mongoose from "mongoose";
+import {
+    Constants,
+    Group,
+    Membership,
+    MembershipStatus,
+    Progress,
+    PaymentPlan,
+    Course,
+} from "@courselit/common-models";
+import { deleteAllLessons } from "../lessons/logic";
+import { deleteMedia, sealMedia } from "@/services/medialit";
+import PageModel from "@/models/Page";
+import { getPrevNextCursor } from "../lessons/helpers";
+import { checkPermission, extractMediaIDs } from "@courselit/utils";
+import { error } from "@/services/logger";
+import {
+    deleteProductsFromPaymentPlans,
+    getPlans,
+} from "../paymentplans/logic";
+import MembershipModel from "@models/Membership";
+import { getActivities } from "../activities/logic";
+import { ActivityType } from "@courselit/common-models/dist/constants";
+import { verifyMandatoryTags } from "../mails/helpers";
+import { Email } from "@courselit/email-editor";
+import PaymentPlanModel from "@models/PaymentPlan";
+import CertificateTemplateModel, {
+    CertificateTemplate,
+} from "@models/CertificateTemplate";
+import CertificateModel from "@models/Certificate";
+import ActivityModel from "@models/Activity";
+import getDeletedMediaIds from "@/lib/get-deleted-media-ids";
+import { deletePageInternal } from "../pages/logic";
+import { replaceTempMediaWithSealedMediaInProseMirrorDoc } from "@/lib/replace-temp-media-with-sealed-media-in-prosemirror-doc";
+
+const { open, itemsPerPage, blogPostSnippetLength, permissions } = constants;
+
+export const getCourseOrThrow = async (
+    id: mongoose.Types.ObjectId | undefined,
+    ctx: GQLContext,
+    courseId?: string,
+): Promise<InternalCourse> => {
+    checkIfAuthenticated(ctx);
+
+    const query = courseId
+        ? {
+              courseId,
+          }
+        : {
+              _id: id,
+          };
+
+    const course = await CourseModel.findOne({
+        ...query,
+        domain: ctx.subdomain._id,
+    });
+
+    if (!course) {
+        throw new Error(responses.item_not_found);
+    }
+
+    if (!checkPermission(ctx.user.permissions, [permissions.manageAnyCourse])) {
+        if (!checkOwnershipWithoutModel(course, ctx)) {
+            throw new Error(responses.item_not_found);
+        } else {
+            if (
+                !checkPermission(ctx.user.permissions, [
+                    permissions.manageCourse,
+                ])
+            ) {
+                throw new Error(responses.action_not_allowed);
+            }
+        }
+    }
+
+    return course;
+};
+
+async function formatCourse(
+    courseId: string,
+    ctx: GQLContext,
+    includeUnpublishedLessons: boolean = false,
+) {
+    const course: InternalCourse | null = (await CourseModel.findOne({
+        courseId,
+        domain: ctx.subdomain._id,
+    }).lean()) as unknown as InternalCourse;
+
+    const paymentPlans = await getPlans({
+        entityId: course!.courseId,
+        entityType: Constants.MembershipEntityType.COURSE,
+        ctx,
+    });
+
+    if (
+        course.type === Constants.CourseType.COURSE ||
+        course.type === Constants.CourseType.DOWNLOAD
+    ) {
+        const { nextLesson } = await getPrevNextCursor(
+            course.courseId,
+            ctx.subdomain._id,
+            undefined,
+            !includeUnpublishedLessons,
+        );
+        (course as any).firstLesson = nextLesson;
+    }
+
+    const result = {
+        ...course,
+        groups: course!.groups?.map((group: any) => ({
+            ...group,
+            id: group._id.toString(),
+        })),
+        paymentPlans,
+    };
+    return result;
+}
+
+export const getCourse = async (
+    id: string,
+    ctx: GQLContext,
+    asGuest: boolean = false,
+) => {
+    const course: InternalCourse | null = (await CourseModel.findOne({
+        courseId: id,
+        domain: ctx.subdomain._id,
+    }).lean()) as unknown as InternalCourse | null;
+
+    if (!course) {
+        throw new Error(responses.item_not_found);
+    }
+
+    if (ctx.user && !asGuest) {
+        const isOwner =
+            checkPermission(ctx.user.permissions, [
+                permissions.manageAnyCourse,
+            ]) || checkOwnershipWithoutModel(course, ctx);
+
+        if (isOwner) {
+            return await formatCourse(course.courseId, ctx, true);
+        }
+    }
+
+    if (course.published) {
+        const formattedCourse = await formatCourse(course.courseId, ctx);
+        return asGuest
+            ? { ...formattedCourse, __forcePublishedLessons: true }
+            : formattedCourse;
+    } else {
+        return null;
+    }
+};
+
+export const createCourse = async (
+    courseData: { title: string; type: Filter },
+    ctx: GQLContext,
+) => {
+    checkIfAuthenticated(ctx);
+    if (
+        !checkPermission(ctx.user.permissions, [
+            permissions.manageAnyCourse,
+            permissions.manageCourse,
+        ])
+    ) {
+        throw new Error(responses.action_not_allowed);
+    }
+
+    if (courseData.type === "blog") {
+        return await setupBlog({
+            title: courseData.title,
+            ctx,
+        });
+    } else {
+        return await setupCourse({
+            title: courseData.title,
+            type: courseData.type,
+            ctx,
+        });
+    }
+};
+
+export const updateCourse = async (
+    courseData: Partial<InternalCourse & { id: string }>,
+    ctx: GQLContext,
+) => {
+    let course = await getCourseOrThrow(undefined, ctx, courseData.id);
+
+    const mediaIdsMarkedForDeletion: string[] = [];
+    if (Object.prototype.hasOwnProperty.call(courseData, "description")) {
+        const nextDescription = (courseData.description ?? "") as string;
+        mediaIdsMarkedForDeletion.push(
+            ...getDeletedMediaIds(course.description || "", nextDescription),
+        );
+    }
+
+    for (const key of Object.keys(courseData)) {
+        if (key === "id") {
+            continue;
+        }
+
+        if (
+            key === "published" &&
+            !checkPermission(ctx.user.permissions, [permissions.publishCourse])
+        ) {
+            throw new Error(responses.action_not_allowed);
+        }
+
+        if (key === "published" && !ctx.user.name) {
+            throw new Error(responses.profile_incomplete);
+        }
+
+        course[key] = courseData[key];
+    }
+
+    course = await validateCourse(course, ctx);
+    if (Object.prototype.hasOwnProperty.call(courseData, "description")) {
+        for (const mediaId of mediaIdsMarkedForDeletion) {
+            await deleteMedia(mediaId);
+        }
+        const descriptionWithSealedMedia =
+            await replaceTempMediaWithSealedMediaInProseMirrorDoc(
+                course.description || "",
+            );
+        course.description = JSON.stringify(descriptionWithSealedMedia);
+    }
+    if (
+        Object.prototype.hasOwnProperty.call(courseData, "featuredImage") &&
+        courseData.featuredImage
+    ) {
+        const featuredImage = await sealMedia(courseData.featuredImage.mediaId);
+        if (featuredImage) {
+            course.featuredImage = featuredImage;
+        }
+    }
+    course = await (course as any).save();
+    await PageModel.updateOne(
+        { entityId: course.courseId, domain: ctx.subdomain._id },
+        { $set: { name: course.title } },
+    );
+    return await formatCourse(course.courseId, ctx);
+};
+
+export const deleteCourse = async (id: string, ctx: GQLContext) => {
+    const course = await getCourseOrThrow(undefined, ctx, id);
+    const certificateTemplate =
+        await CertificateTemplateModel.findOne<CertificateTemplate | null>({
+            domain: ctx.subdomain._id,
+            courseId: course.courseId,
+        });
+    if (certificateTemplate?.signatureImage?.mediaId) {
+        await deleteMedia(certificateTemplate.signatureImage.mediaId);
+    }
+    if (certificateTemplate?.logo?.mediaId) {
+        await deleteMedia(certificateTemplate.logo.mediaId);
+    }
+    await CertificateTemplateModel.deleteOne({
+        domain: ctx.subdomain._id,
+        courseId: course.courseId,
+    });
+    await CertificateModel.deleteMany({
+        domain: ctx.subdomain._id,
+        courseId: course.courseId,
+    });
+    await MembershipModel.deleteMany({
+        domain: ctx.subdomain._id,
+        entityId: course.courseId,
+        entityType: Constants.MembershipEntityType.COURSE,
+    });
+    await PaymentPlanModel.deleteMany({
+        domain: ctx.subdomain._id,
+        entityId: course.courseId,
+        entityType: Constants.MembershipEntityType.COURSE,
+    });
+    await deleteProductsFromPaymentPlans({
+        domain: ctx.subdomain._id,
+        courseId: course.courseId,
+    });
+    await ActivityModel.deleteMany({
+        domain: ctx.subdomain._id,
+        $or: [
+            { entityId: course.courseId },
+            { "metadata.courseId": course.courseId },
+        ],
+    });
+    await deleteAllLessons(course.courseId, ctx);
+    if (course.featuredImage) {
+        try {
+            await deleteMedia(course.featuredImage.mediaId);
+        } catch (err) {
+            error(err.message, {
+                stack: err.stack,
+            });
+        }
+    }
+    if (course.description) {
+        const extractedMediaIds = extractMediaIDs(course.description || "");
+        for (const mediaId of Array.from(extractedMediaIds)) {
+            await deleteMedia(mediaId);
+        }
+    }
+    await UserModel.updateMany(
+        {
+            domain: ctx.subdomain._id,
+        },
+        {
+            $pull: {
+                purchases: {
+                    courseId: course.courseId,
+                },
+            },
+        },
+    );
+    await deletePageInternal(ctx, course.pageId!);
+    await CourseModel.deleteOne({
+        domain: ctx.subdomain._id,
+        courseId: course.courseId,
+    });
+    return true;
+};
+
+export const getCoursesAsAdmin = async ({
+    offset,
+    context,
+    searchText,
+    filterBy,
+}: {
+    offset: number;
+    context: GQLContext;
+    searchText?: string;
+    filterBy?: Filter[];
+}) => {
+    checkIfAuthenticated(context);
+    validateOffset(offset);
+    const user = context.user;
+
+    if (
+        !checkPermission(user.permissions, [
+            permissions.manageCourse,
+            permissions.manageAnyCourse,
+        ])
+    ) {
+        throw new Error(responses.action_not_allowed);
+    }
+
+    const query: Partial<Omit<InternalCourse, "type">> & {
+        $text?: Record<string, unknown>;
+        type?: string | { $in: string[] };
+    } = {
+        domain: context.subdomain._id,
+    };
+    if (!checkPermission(user.permissions, [permissions.manageAnyCourse])) {
+        query.creatorId = user.userId;
+    }
+
+    if (filterBy) {
+        query.type = { $in: filterBy };
+    } else {
+        query.type = { $in: [constants.download, constants.course] };
+    }
+
+    if (searchText) query.$text = { $search: searchText };
+
+    const courses = await getPaginatedCoursesForAdmin({
+        query,
+        page: offset,
+    });
+
+    return courses.map(async (course) => ({
+        ...course,
+        customers: await (MembershipModel as any).countDocuments({
+            entityId: course.courseId,
+            entityType: Constants.MembershipEntityType.COURSE,
+            domain: context.subdomain._id,
+        }),
+        sales: (
+            await getActivities({
+                entityId: course.courseId,
+                type: ActivityType.PURCHASED,
+                duration: "lifetime",
+                ctx: context,
+            })
+        ).count,
+    }));
+};
+
+export const getCourses = async ({
+    offset,
+    ctx,
+    tag,
+    filterBy,
+    ids,
+}: {
+    ctx: GQLContext;
+    offset?: number;
+    ids?: string[];
+    tag?: string;
+    filterBy?: Filter[];
+}) => {
+    const query: Record<string, unknown> = {
+        published: true,
+        privacy: Constants.ProductAccessType.PUBLIC,
+        domain: ctx.subdomain._id,
+    };
+
+    let courses;
+    if (ids) {
+        query.courseId = {
+            $in: ids,
+        };
+        courses = await CourseModel.find(query, {
+            id: 1,
+            title: 1,
+            cost: 1,
+            description: 1,
+            type: 1,
+            updatedAt: 1,
+            slug: 1,
+            featuredImage: 1,
+            courseId: 1,
+            tags: 1,
+            groups: 1,
+            pageId: 1,
+        });
+    } else {
+        validateOffset(offset);
+        if (tag) {
+            query.tags = tag;
+        }
+        if (filterBy) {
+            query.type = { $in: filterBy };
+        }
+        courses = await CourseModel.find(query, {
+            id: 1,
+            title: 1,
+            cost: 1,
+            description: 1,
+            type: 1,
+            updatedAt: 1,
+            slug: 1,
+            featuredImage: 1,
+            courseId: 1,
+            tags: 1,
+            groups: 1,
+            pageId: 1,
+        })
+            .sort({ updatedAt: -1 })
+            .skip((offset! - 1) * itemsPerPage)
+            .limit(itemsPerPage);
+    }
+
+    return courses.map(async (x) => ({
+        id: x.id,
+        title: x.title,
+        cost: x.cost,
+        description: x.description,
+        type: x.type,
+        updatedAt: x.updatedAt,
+        slug: x.slug,
+        featuredImage: x.featuredImage,
+        courseId: x.courseId,
+        tags: x.tags,
+        groups: x.isBlog ? null : x.groups,
+        pageId: x.isBlog ? undefined : x.pageId,
+    }));
+};
+
+const getProductsQuery = (
+    ctx: GQLContext,
+    filter?: Filter[],
+    tags?: string[],
+    ids?: string[],
+    publicView: boolean = false,
+) => {
+    const query: Record<string, unknown> = {
+        domain: ctx.subdomain._id,
+    };
+
+    if (
+        !publicView &&
+        ctx.user &&
+        checkPermission(ctx.user.permissions, [
+            permissions.manageAnyCourse,
+            permissions.manageCourse,
+        ])
+    ) {
+        if (
+            checkPermission(ctx.user.permissions, [permissions.manageAnyCourse])
+        ) {
+            // do nothing
+        } else {
+            query.creatorId = ctx.user.userId;
+        }
+    } else {
+        query.published = true;
+        query.privacy = Constants.ProductAccessType.PUBLIC;
+    }
+
+    if (filter) {
+        query.type = { $in: filter };
+    } else {
+        query.type = { $in: [constants.download, constants.course] };
+    }
+
+    if (tags) {
+        query.tags = { $in: tags };
+    }
+
+    if (ids) {
+        query.courseId = {
+            $in: ids,
+        };
+    }
+
+    return query;
+};
+
+export const getProducts = async ({
+    ctx,
+    page = 1,
+    limit = 10,
+    filterBy,
+    tags,
+    ids,
+    publicView,
+    sort = -1,
+}: {
+    ctx: GQLContext;
+    page?: number;
+    limit?: number;
+    filterBy?: Filter[];
+    tags?: string[];
+    ids?: string[];
+    publicView?: boolean;
+    sort?: number;
+}): Promise<InternalCourse[]> => {
+    const query = getProductsQuery(ctx, filterBy, tags, ids, publicView);
+
+    const courses = await (CourseModel as any).paginatedFind(query, {
+        page,
+        limit,
+        sort,
+    });
+
+    const hasManagePerm =
+        ctx.user &&
+        checkPermission(ctx.user.permissions, [
+            permissions.manageAnyCourse,
+            permissions.manageCourse,
+        ]);
+
+    const products: InternalCourse[] = [];
+
+    for (const course of courses) {
+        const customers =
+            hasManagePerm && course.type !== constants.blog
+                ? await (MembershipModel as any).countDocuments({
+                      entityId: course.courseId,
+                      entityType: Constants.MembershipEntityType.COURSE,
+                      domain: ctx.subdomain._id,
+                      status: Constants.MembershipStatus.ACTIVE,
+                  })
+                : undefined;
+        const sales =
+            hasManagePerm && course.type !== constants.blog
+                ? (
+                      await getActivities({
+                          entityId: course.courseId,
+                          type: ActivityType.PURCHASED,
+                          duration: "lifetime",
+                          ctx,
+                      })
+                  ).count
+                : undefined;
+        const paymentPlans =
+            course.type !== constants.blog
+                ? await getPlans({
+                      entityId: course.courseId,
+                      entityType: Constants.MembershipEntityType.COURSE,
+                      ctx,
+                  })
+                : undefined;
+        const extendedCourse: InternalCourse & {
+            customers?: number;
+            sales: number;
+            paymentPlans?: PaymentPlan[];
+        } = {
+            ...course,
+            groups: course.type !== constants.blog ? course.groups : null,
+            pageId: course.type !== constants.blog ? course.pageId : undefined,
+            customers,
+            sales: sales ?? 0,
+            ...(paymentPlans ? { paymentPlans } : {}),
+        };
+
+        products.push(extendedCourse);
+    }
+
+    return products;
+};
+
+export const getProductsCount = async ({
+    ctx,
+    filterBy,
+    tags,
+    ids,
+    publicView,
+}: {
+    ctx: GQLContext;
+    filterBy?: Filter[];
+    tags?: string[];
+    ids?: string[];
+    publicView?: boolean;
+}) => {
+    const query = getProductsQuery(ctx, filterBy, tags, ids, publicView);
+
+    return await (CourseModel as any).countDocuments(query);
+};
+
+export const addGroup = async ({
+    id,
+    name,
+    collapsed,
+    ctx,
+}: {
+    id: string;
+    name: string;
+    collapsed: boolean;
+    ctx: GQLContext;
+}) => {
+    const course = await getCourseOrThrow(undefined, ctx, id);
+    if (
+        course.type === Constants.CourseType.DOWNLOAD &&
+        course.groups?.length === 1
+    ) {
+        throw new Error(responses.download_course_cannot_have_groups);
+    }
+
+    const existingName = (group: Group) => group.name === name;
+
+    if (course.groups?.some(existingName)) {
+        throw new Error(responses.existing_group);
+    }
+
+    const maximumRank =
+        course.groups?.reduce(
+            (acc: number, value: { rank: number }) =>
+                value.rank > acc ? value.rank : acc,
+            0,
+        ) ?? 0;
+
+    await (course.groups as any).push({
+        rank: maximumRank + 1000,
+        name,
+    } as Group);
+
+    await (course as any).save();
+
+    return await formatCourse(course.courseId, ctx);
+};
+
+export const removeGroup = async (
+    id: string,
+    courseId: string,
+    ctx: GQLContext,
+) => {
+    const course = await getCourseOrThrow(undefined, ctx, courseId);
+    const group = course.groups?.find((group) => group.id === id);
+
+    if (!group) {
+        return await formatCourse(course.courseId, ctx);
+    }
+
+    if (
+        course.type === Constants.CourseType.DOWNLOAD &&
+        course.groups?.length === 1
+    ) {
+        throw new Error(responses.download_course_last_group_cannot_be_removed);
+    }
+
+    const countOfAssociatedLessons = await Lesson.countDocuments({
+        courseId,
+        groupId: group.id,
+        domain: ctx.subdomain._id,
+    });
+
+    if (countOfAssociatedLessons > 0) {
+        throw new Error(responses.group_not_empty);
+    }
+
+    await (course.groups as any).pull({ _id: id });
+    await (course as any).save();
+
+    await UserModel.updateMany(
+        {
+            domain: ctx.subdomain._id,
+        },
+        {
+            $pull: {
+                "purchases.$[elem].accessibleGroups": id,
+            },
+        },
+        {
+            arrayFilters: [{ "elem.courseId": courseId }],
+        },
+    );
+
+    return await formatCourse(course.courseId, ctx);
+};
+
+export const updateGroup = async ({
+    id,
+    courseId,
+    name,
+    rank,
+    collapsed,
+    lessonsOrder,
+    drip,
+    ctx,
+}) => {
+    const course = await getCourseOrThrow(undefined, ctx, courseId);
+
+    const $set = {};
+    if (name) {
+        const existingName = (group) =>
+            group.name === name && group._id.toString() !== id;
+
+        if (course.groups?.some(existingName)) {
+            throw new Error(responses.existing_group);
+        }
+
+        $set["groups.$.name"] = name;
+    }
+
+    if (rank) {
+        $set["groups.$.rank"] = rank;
+    }
+
+    if (
+        lessonsOrder &&
+        lessonsOrder.every((lessonId) => course.lessons?.includes(lessonId)) &&
+        lessonsOrder.every((lessonId) =>
+            course.groups
+                ?.find((group) => group.id === id)
+                ?.lessonsOrder.includes(lessonId),
+        )
+    ) {
+        $set["groups.$.lessonsOrder"] = lessonsOrder;
+    }
+
+    if (typeof collapsed === "boolean") {
+        $set["groups.$.collapsed"] = collapsed;
+    }
+
+    if (drip) {
+        if (drip.status) {
+            $set["groups.$.drip.status"] = drip.status;
+        }
+        if (drip.type) {
+            $set["groups.$.drip.type"] = drip.type;
+        }
+        if (drip.type === Constants.dripType[0]) {
+            if (drip.delayInMillis) {
+                $set["groups.$.drip.delayInMillis"] =
+                    drip.delayInMillis * 86400000;
+            }
+            $set["groups.$.drip.dateInUTC"] = drip.dateInUTC;
+        }
+        if (drip.type === Constants.dripType[1]) {
+            $set["groups.$.drip.delayInMillis"] = null;
+            if (drip.dateInUTC) {
+                $set["groups.$.drip.dateInUTC"] = drip.dateInUTC;
+            }
+        }
+        if (drip.email) {
+            if (!drip.email.content || !drip.email.subject) {
+                throw new Error(responses.invalid_drip_email);
+            }
+            const parsedContent: Email = JSON.parse(drip.email.content);
+            verifyMandatoryTags(parsedContent.content);
+
+            $set["groups.$.drip.email"] = {
+                content: parsedContent,
+                subject: drip.email.subject,
+                published: true,
+                delayInMillis: 0,
+            };
+        } else {
+            $set["groups.$.drip.email"] = null;
+        }
+    }
+
+    return await CourseModel.findOneAndUpdate(
+        {
+            domain: ctx.subdomain._id,
+            courseId: course.courseId,
+            "groups._id": id,
+        },
+        { $set },
+        { new: true },
+    );
+};
+
+export const getMembers = async ({
+    ctx,
+    courseId,
+    page = 1,
+    limit = 10,
+    status,
+}: {
+    ctx: GQLContext;
+    courseId: string;
+    page?: number;
+    limit?: number;
+    status?: MembershipStatus;
+}): Promise<
+    (Pick<
+        Membership,
+        "userId" | "status" | "subscriptionMethod" | "subscriptionId"
+    > &
+        Partial<
+            Pick<
+                Progress,
+                "completedLessons" | "createdAt" | "updatedAt" | "downloaded"
+            >
+        >)[]
+> => {
+    const course = await getCourseOrThrow(undefined, ctx, courseId);
+
+    const query: Record<string, unknown> = {
+        domain: ctx.subdomain._id,
+        entityId: course.courseId,
+        entityType: Constants.MembershipEntityType.COURSE,
+    };
+
+    if (status) {
+        query.status = status;
+    }
+
+    const members: Membership[] = await (MembershipModel as any).paginatedFind(
+        query,
+        {
+            page,
+            limit,
+        },
+    );
+
+    return await Promise.all(
+        members.map(async (member) => {
+            const user = await UserModel.findOne<User>({
+                domain: ctx.subdomain._id,
+                userId: member.userId,
+            });
+
+            const purchase = user?.purchases.find(
+                (purchase) => purchase.courseId === course.courseId,
+            );
+
+            return {
+                userId: member.userId,
+                status: member.status,
+                subscriptionMethod: member.subscriptionMethod,
+                subscriptionId: member.subscriptionId,
+                completedLessons: purchase?.completedLessons,
+                createdAt: purchase?.createdAt,
+                updatedAt: purchase?.updatedAt,
+                downloaded: purchase?.downloaded,
+            };
+        }),
+    );
+};
+
+export const getStudents = async ({
+    course,
+    ctx,
+    text,
+}: {
+    course: Pick<Course, "courseId">;
+    ctx: GQLContext;
+    text?: string;
+}) => {
+    const matchCondition = text
+        ? {
+              $match: {
+                  "purchases.courseId": course.courseId,
+                  domain: ctx.subdomain._id,
+                  $or: [
+                      { email: new RegExp(text) },
+                      { name: new RegExp(text) },
+                  ],
+              },
+          }
+        : {
+              $match: {
+                  "purchases.courseId": course.courseId,
+                  domain: ctx.subdomain._id,
+              },
+          };
+
+    const result = await UserModel.aggregate([
+        matchCondition,
+        {
+            $addFields: {
+                completedLessons: {
+                    $filter: {
+                        input: "$purchases",
+                        as: "t",
+                        cond: {
+                            $eq: ["$$t.courseId", course.courseId],
+                        },
+                    },
+                },
+            },
+        },
+        {
+            $unwind: "$completedLessons",
+        },
+        {
+            $addFields: {
+                progress: "$completedLessons.completedLessons",
+                signedUpOn: "$completedLessons.createdAt",
+                lastAccessedOn: "$completedLessons.updatedAt",
+                downloaded: "$completedLessons.downloaded",
+            },
+        },
+        {
+            $project: {
+                userId: 1,
+                email: 1,
+                name: 1,
+                progress: 1,
+                signedUpOn: 1,
+                lastAccessedOn: 1,
+                downloaded: 1,
+                avatar: 1,
+            },
+        },
+    ]);
+
+    return result;
+};
+
+export const getCourseCertificateTemplate = async (
+    courseId: string,
+    ctx: GQLContext,
+) => {
+    const course = await getCourseOrThrow(undefined, ctx, courseId);
+
+    const certificateTemplate = await CertificateTemplateModel.findOne({
+        domain: ctx.subdomain._id,
+        courseId: course.courseId,
+    });
+
+    return certificateTemplate;
+};
+
+export const updateCourseCertificateTemplate = async ({
+    courseId,
+    ctx,
+    title,
+    subtitle,
+    description,
+    signatureImage,
+    signatureName,
+    signatureDesignation,
+    logo,
+}: {
+    courseId: string;
+    ctx: GQLContext;
+    title?: string;
+    subtitle?: string;
+    description?: string;
+    signatureImage?: Media;
+    signatureName?: string;
+    signatureDesignation?: string;
+    logo?: Media;
+}) => {
+    const course = await getCourseOrThrow(undefined, ctx, courseId);
+
+    if (signatureImage) {
+        const sealedImage = await sealMedia(signatureImage.mediaId);
+        if (sealedImage) {
+            signatureImage = sealedImage;
+        }
+    }
+
+    if (logo) {
+        const sealedLogo = await sealMedia(logo.mediaId);
+        if (sealedLogo) {
+            logo = sealedLogo;
+        }
+    }
+
+    const updatedTemplate = await CertificateTemplateModel.findOneAndUpdate(
+        {
+            domain: ctx.subdomain._id,
+            courseId: course.courseId,
+        },
+        {
+            title,
+            subtitle,
+            description,
+            signatureImage,
+            signatureName,
+            signatureDesignation,
+            logo,
+        },
+        { upsert: true, new: true },
+    );
+    return {
+        title: updatedTemplate.title,
+        subtitle: updatedTemplate.subtitle,
+        description: updatedTemplate.description,
+        signatureImage: updatedTemplate.signatureImage,
+        signatureName: updatedTemplate.signatureName,
+        signatureDesignation: updatedTemplate.signatureDesignation,
+        logo: updatedTemplate.logo,
+    };
+};
